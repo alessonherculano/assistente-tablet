@@ -1,7 +1,8 @@
 package com.assistente.tablet
 
+import android.Manifest
 import android.app.Activity
-import android.content.ActivityNotFoundException
+import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -15,18 +16,19 @@ import android.media.ToneGenerator
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
-import android.view.inputmethod.EditorInfo
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.GridLayout
 import android.widget.LinearLayout
-import android.widget.ScrollView
 import android.widget.TextView
 import org.json.JSONArray
 import org.json.JSONObject
@@ -45,30 +47,40 @@ class MainActivity : Activity() {
         val notified: Boolean
     )
 
-    // ---------- cores ----------
-    private val cBg = Color.parseColor("#FBFBF6")
-    private val cText = Color.parseColor("#1E2430")
-    private val cGray = Color.parseColor("#6B7280")
+    // =====================================================================
+    //  AJUSTES FÁCEIS (mude aqui se quiser)
+    // =====================================================================
+    private val DIM_BRIGHTNESS = 0.02f     // brilho da tela em espera (0.0 a 1.0)
+    private val DIM_ALPHA = 0.35f          // intensidade do conteúdo em espera (0.0 a 1.0)
+    private val AWAKE_BRIGHTNESS = 0.8f    // brilho quando você chama o assistente
+    private val AWAKE_MS = 20000L          // tempo acordado antes de voltar a dormir (20 s)
+    private val DEFAULT_NAME = "Luna"      // nome inicial do assistente
+
+    // ---------- cores (tema escuro) ----------
+    private val cText = Color.parseColor("#E6E6E6")
+    private val cGray = Color.parseColor("#8A8F98")
     private val cAccent = Color.parseColor("#1565C0")
-    private val cCell = Color.parseColor("#EFEFE6")
+    private val cCell = Color.parseColor("#1A1D22")
+    private val cEvent = Color.parseColor("#1F3A5F")
 
     // ---------- formatos ----------
     private val ptBR = Locale("pt", "BR")
     private val keyFmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)
     private val hmFmt = SimpleDateFormat("HH:mm", Locale.US)
-    private val clockFmt = SimpleDateFormat("HH:mm:ss", ptBR)
+    private val clockFmt = SimpleDateFormat("HH:mm", ptBR)
     private val dateFmt = SimpleDateFormat("EEEE, d 'de' MMMM 'de' yyyy", ptBR)
     private val monthFmt = SimpleDateFormat("MMMM 'de' yyyy", ptBR)
 
     // ---------- telas ----------
+    private lateinit var main: LinearLayout
     private lateinit var tvClock: TextView
     private lateinit var tvDate: TextView
     private lateinit var tvStatus: TextView
+    private lateinit var tvListen: TextView
     private lateinit var tvBanner: TextView
     private lateinit var tvMonth: TextView
     private lateinit var grid: GridLayout
-    private lateinit var agendaBox: LinearLayout
-    private lateinit var input: EditText
+    private lateinit var tasksBox: LinearLayout
     private lateinit var whiteOverlay: View
 
     // ---------- estado ----------
@@ -76,6 +88,14 @@ class MainActivity : Activity() {
     private var shown: Calendar = firstOfThisMonth()
     private var lastDayKey = ""
     private var tickCount = 0
+    private var awake = false
+    private var screenLightOn = false
+    private var wakeName = DEFAULT_NAME
+
+    // ---------- microfone ----------
+    private var recognizer: SpeechRecognizer? = null
+    private var micWanted = false
+    private var askedMic = false
 
     private val prefs by lazy { getSharedPreferences("assistente", Context.MODE_PRIVATE) }
 
@@ -86,6 +106,18 @@ class MainActivity : Activity() {
         }
     }
 
+    private val sleepRunnable = Runnable {
+        if (screenLightOn || tvBanner.visibility == View.VISIBLE) {
+            scheduleSleep(AWAKE_MS)
+        } else {
+            goToSleep()
+        }
+    }
+
+    private val restartRunnable = Runnable {
+        if (micWanted) startRecognizer()
+    }
+
     // =====================================================================
     //  Ciclo de vida
     // =====================================================================
@@ -93,18 +125,83 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        wakeName = prefs.getString("wake_name", DEFAULT_NAME) ?: DEFAULT_NAME
         buildUi()
+        updateListenLabel()
+        applyMode()
     }
 
     override fun onResume() {
         super.onResume()
         handler.removeCallbacks(ticker)
         handler.post(ticker)
+        wakeUp()
+        startMic()
     }
 
     override fun onPause() {
         super.onPause()
         handler.removeCallbacks(ticker)
+        handler.removeCallbacks(sleepRunnable)
+        stopMic()
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            window.decorView.systemUiVisibility = (View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                or View.SYSTEM_UI_FLAG_FULLSCREEN
+                or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION)
+        }
+    }
+
+    /** Se a tela está em espera, o primeiro toque só acorda (não aperta nada sem querer). */
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (ev.action == MotionEvent.ACTION_DOWN) {
+            if (!awake && !screenLightOn) {
+                wakeUp()
+                return true
+            }
+            if (awake) wakeUp()
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
+    // =====================================================================
+    //  Modo espera (escuro) / modo ativo
+    // =====================================================================
+
+    private fun applyMode() {
+        main.alpha = if (awake || screenLightOn) 1f else DIM_ALPHA
+        val p = window.attributes
+        p.screenBrightness = when {
+            screenLightOn -> 1f
+            awake -> AWAKE_BRIGHTNESS
+            else -> DIM_BRIGHTNESS
+        }
+        window.attributes = p
+    }
+
+    private fun scheduleSleep(ms: Long) {
+        handler.removeCallbacks(sleepRunnable)
+        handler.postDelayed(sleepRunnable, ms)
+    }
+
+    private fun wakeUp(holdMs: Long = AWAKE_MS) {
+        awake = true
+        applyMode()
+        scheduleSleep(holdMs)
+    }
+
+    private fun goToSleep() {
+        awake = false
+        handler.removeCallbacks(sleepRunnable)
+        applyMode()
+        status("Em espera. Diga \"$wakeName\" para me chamar.")
     }
 
     // =====================================================================
@@ -128,111 +225,68 @@ class MainActivity : Activity() {
         return p
     }
 
+    /** Parâmetro "metade do espaço": usa largura em paisagem e altura em retrato. */
+    private fun half(landscape: Boolean, weight: Float = 1f): LinearLayout.LayoutParams {
+        return if (landscape) {
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, weight)
+        } else {
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, weight)
+        }
+    }
+
     private fun buildUi() {
         val landscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
         val match = ViewGroup.LayoutParams.MATCH_PARENT
         val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
 
         val root = FrameLayout(this)
-        root.setBackgroundColor(cBg)
+        root.setBackgroundColor(Color.BLACK)
 
-        val scroll = ScrollView(this)
-        scroll.isFillViewport = true
+        main = LinearLayout(this)
+        main.orientation = LinearLayout.VERTICAL
+        main.setPadding(dp(18), dp(12), dp(18), dp(8))
 
-        val main = LinearLayout(this)
-        main.orientation = if (landscape) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
-        main.setPadding(dp(20), dp(16), dp(20), dp(16))
-
-        val left = LinearLayout(this)
-        left.orientation = LinearLayout.VERTICAL
-        val right = LinearLayout(this)
-        right.orientation = LinearLayout.VERTICAL
-
-        if (landscape) {
-            left.setPadding(0, 0, dp(14), 0)
-            main.addView(left, LinearLayout.LayoutParams(0, wrap, 1f))
-            main.addView(right, LinearLayout.LayoutParams(0, wrap, 1.25f))
-        } else {
-            main.addView(left, LinearLayout.LayoutParams(match, wrap))
-            main.addView(right, LinearLayout.LayoutParams(match, wrap))
+        // ----- aviso de lembrete (some quando não há lembrete) -----
+        tvBanner = TextView(this)
+        tvBanner.textSize = 26f
+        tvBanner.setTextColor(Color.parseColor("#1E2430"))
+        tvBanner.setBackgroundColor(Color.parseColor("#FFE9A8"))
+        tvBanner.setPadding(dp(14), dp(12), dp(14), dp(12))
+        tvBanner.visibility = View.GONE
+        tvBanner.setOnClickListener {
+            tvBanner.visibility = View.GONE
+            wakeUp()
         }
+        main.addView(tvBanner, lp())
 
-        // ----- coluna da esquerda: relógio, microfone, status, agenda -----
+        // =================== METADE DE CIMA: relógio + calendário ===================
+        val top = LinearLayout(this)
+        top.orientation = if (landscape) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
+
+        // ----- relógio -----
+        val clockPanel = LinearLayout(this)
+        clockPanel.orientation = LinearLayout.VERTICAL
+        clockPanel.gravity = Gravity.CENTER
+
         tvClock = TextView(this)
-        tvClock.textSize = 76f
+        tvClock.textSize = 120f
         tvClock.setTypeface(null, Typeface.BOLD)
         tvClock.setTextColor(cText)
-        left.addView(tvClock, lp())
+        tvClock.gravity = Gravity.CENTER
+        tvClock.includeFontPadding = false
+        clockPanel.addView(tvClock, LinearLayout.LayoutParams(wrap, wrap))
 
         tvDate = TextView(this)
         tvDate.textSize = 22f
         tvDate.setTextColor(cGray)
-        left.addView(tvDate, lp())
+        tvDate.gravity = Gravity.CENTER
+        clockPanel.addView(tvDate, LinearLayout.LayoutParams(wrap, wrap))
 
-        val mic = Button(this)
-        mic.text = "🎤  Toque e fale"
-        mic.textSize = 28f
-        mic.setTextColor(Color.WHITE)
-        mic.setBackgroundColor(cAccent)
-        mic.setOnClickListener { listen() }
-        left.addView(mic, LinearLayout.LayoutParams(match, dp(96)).apply { topMargin = dp(18) })
+        // ----- calendário -----
+        val calPanel = LinearLayout(this)
+        calPanel.orientation = LinearLayout.VERTICAL
+        calPanel.setPadding(dp(8), 0, 0, 0)
 
-        val row = LinearLayout(this)
-        row.orientation = LinearLayout.HORIZONTAL
-        input = EditText(this)
-        input.hint = "ou digite o comando aqui"
-        input.setSingleLine(true)
-        input.imeOptions = EditorInfo.IME_ACTION_SEND
-        input.setOnEditorActionListener { _, _, _ ->
-            submitText()
-            true
-        }
-        val ok = Button(this)
-        ok.text = "OK"
-        ok.setOnClickListener { submitText() }
-        row.addView(input, LinearLayout.LayoutParams(0, wrap, 1f))
-        row.addView(ok, LinearLayout.LayoutParams(wrap, wrap))
-        left.addView(row, lp(8))
-
-        tvStatus = TextView(this)
-        tvStatus.textSize = 20f
-        tvStatus.setTextColor(cAccent)
-        tvStatus.text = "Pronto. Toque no microfone e diga um comando."
-        tvStatus.setPadding(dp(4), dp(10), dp(4), dp(10))
-        left.addView(tvStatus, lp(4))
-
-        tvBanner = TextView(this)
-        tvBanner.textSize = 26f
-        tvBanner.setTextColor(cText)
-        tvBanner.setBackgroundColor(Color.parseColor("#FFE9A8"))
-        tvBanner.setPadding(dp(14), dp(14), dp(14), dp(14))
-        tvBanner.visibility = View.GONE
-        tvBanner.setOnClickListener { tvBanner.visibility = View.GONE }
-        left.addView(tvBanner, lp(4))
-
-        val hints = TextView(this)
-        hints.textSize = 16f
-        hints.setTextColor(cGray)
-        hints.text = "Exemplos:\n" +
-            "• \"acender lanterna\" / \"apagar lanterna\"\n" +
-            "• \"criar agenda amanhã às 10 horas dentista\"\n" +
-            "• \"marcar dia 15 às 14:30 reunião\"\n" +
-            "• \"lembrar sexta às 8 da manhã pagar conta\"\n" +
-            "• \"acender a luz da sala\" (em breve)"
-        left.addView(hints, lp(8))
-
-        val agendaTitle = TextView(this)
-        agendaTitle.text = "Próximos compromissos"
-        agendaTitle.textSize = 22f
-        agendaTitle.setTypeface(null, Typeface.BOLD)
-        agendaTitle.setTextColor(cText)
-        left.addView(agendaTitle, lp(18))
-
-        agendaBox = LinearLayout(this)
-        agendaBox.orientation = LinearLayout.VERTICAL
-        left.addView(agendaBox, lp(6))
-
-        // ----- coluna da direita: calendário do mês -----
         val nav = LinearLayout(this)
         nav.orientation = LinearLayout.HORIZONTAL
         nav.gravity = Gravity.CENTER_VERTICAL
@@ -256,7 +310,7 @@ class MainActivity : Activity() {
             buildCalendar()
         }
         tvMonth = TextView(this)
-        tvMonth.textSize = 28f
+        tvMonth.textSize = 24f
         tvMonth.setTypeface(null, Typeface.BOLD)
         tvMonth.setTextColor(cText)
         tvMonth.gravity = Gravity.CENTER
@@ -265,14 +319,78 @@ class MainActivity : Activity() {
         nav.addView(tvMonth, LinearLayout.LayoutParams(0, wrap, 1f))
         nav.addView(next, LinearLayout.LayoutParams(wrap, wrap))
         nav.addView(today, LinearLayout.LayoutParams(wrap, wrap))
-        right.addView(nav, lp())
+        calPanel.addView(nav, lp())
 
         grid = GridLayout(this)
         grid.columnCount = 7
-        right.addView(grid, lp(10))
+        calPanel.addView(grid, LinearLayout.LayoutParams(match, 0, 1f))
 
-        scroll.addView(main, FrameLayout.LayoutParams(match, wrap))
-        root.addView(scroll, FrameLayout.LayoutParams(match, match))
+        top.addView(clockPanel, half(landscape))
+        top.addView(calPanel, half(landscape))
+        main.addView(top, LinearLayout.LayoutParams(match, 0, 1.5f))
+
+        // =================== METADE DE BAIXO: tarefas + 3 botões ===================
+        val bottom = LinearLayout(this)
+        bottom.orientation = if (landscape) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
+
+        val tasksPanel = LinearLayout(this)
+        tasksPanel.orientation = LinearLayout.VERTICAL
+        tasksPanel.setPadding(0, dp(6), dp(8), 0)
+
+        val tasksTitle = TextView(this)
+        tasksTitle.text = "Próximas tarefas"
+        tasksTitle.textSize = 20f
+        tasksTitle.setTypeface(null, Typeface.BOLD)
+        tasksTitle.setTextColor(cText)
+        tasksPanel.addView(tasksTitle, lp())
+
+        tasksBox = LinearLayout(this)
+        tasksBox.orientation = LinearLayout.VERTICAL
+        tasksPanel.addView(tasksBox, lp(4))
+
+        val buttonsRow = LinearLayout(this)
+        buttonsRow.orientation = LinearLayout.HORIZONTAL
+        buttonsRow.setPadding(dp(8), dp(6), 0, 0)
+        for (n in 1..3) {
+            val b = Button(this)
+            b.text = "Função $n\n(em breve)"
+            b.setAllCaps(false)
+            b.textSize = 18f
+            b.setTextColor(cGray)
+            b.setBackgroundColor(cCell)
+            b.setOnClickListener { onFuncButton(n) }
+            val p = LinearLayout.LayoutParams(0, match, 1f)
+            p.setMargins(dp(5), dp(5), dp(5), dp(5))
+            buttonsRow.addView(b, p)
+        }
+
+        bottom.addView(tasksPanel, half(landscape))
+        bottom.addView(buttonsRow, half(landscape))
+        main.addView(bottom, LinearLayout.LayoutParams(match, 0, 1f))
+
+        // =================== BARRA DE STATUS ===================
+        val bar = LinearLayout(this)
+        bar.orientation = LinearLayout.HORIZONTAL
+        bar.gravity = Gravity.CENTER_VERTICAL
+
+        tvStatus = TextView(this)
+        tvStatus.textSize = 16f
+        tvStatus.setTextColor(cGray)
+        tvStatus.setPadding(dp(4), dp(8), dp(4), dp(8))
+        tvStatus.text = "Toque aqui para digitar um comando."
+        tvStatus.setOnClickListener { showTypeDialog() }
+
+        tvListen = TextView(this)
+        tvListen.textSize = 16f
+        tvListen.setTextColor(cAccent)
+        tvListen.setPadding(dp(10), dp(8), dp(4), dp(8))
+        tvListen.setOnClickListener { showNameDialog() }
+
+        bar.addView(tvStatus, LinearLayout.LayoutParams(0, wrap, 1f))
+        bar.addView(tvListen, LinearLayout.LayoutParams(wrap, wrap))
+        main.addView(bar, lp())
+
+        root.addView(main, FrameLayout.LayoutParams(match, match))
 
         // Tela branca usada como "lanterna de tela" quando o tablet não tem flash
         whiteOverlay = View(this)
@@ -284,61 +402,112 @@ class MainActivity : Activity() {
         setContentView(root)
     }
 
-    private fun cell(text: String, bold: Boolean, fg: Int, bgc: Int?): TextView {
+    private fun updateListenLabel() {
+        tvListen.text = if (micWanted) "🎤 Diga \"$wakeName\"" else "🎤 desligado"
+    }
+
+    private fun cap(s: String): String = s.replaceFirstChar { it.uppercase() }
+
+    private fun onFuncButton(n: Int) {
+        // PRÓXIMAS ETAPAS: cada botão poderá ligar uma função (luzes, música, etc.)
+        wakeUp()
+        status("O botão $n ainda não tem função. Em breve!")
+    }
+
+    private fun showTypeDialog() {
+        wakeUp(60000L)
+        val et = EditText(this)
+        et.hint = "ex.: acender lanterna"
+        et.setSingleLine(true)
+        AlertDialog.Builder(this)
+            .setTitle("Digitar comando")
+            .setView(et)
+            .setPositiveButton("Enviar") { _, _ ->
+                val s = et.text.toString().trim()
+                if (s.isNotEmpty()) handle(s)
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
+    private fun showNameDialog() {
+        wakeUp(60000L)
+        val et = EditText(this)
+        et.setText(wakeName)
+        et.setSingleLine(true)
+        AlertDialog.Builder(this)
+            .setTitle("Nome do assistente")
+            .setMessage("É por esse nome que você me chama.")
+            .setView(et)
+            .setPositiveButton("Salvar") { _, _ ->
+                val s = et.text.toString().trim()
+                if (s.isNotEmpty()) {
+                    wakeName = s
+                    prefs.edit().putString("wake_name", s).apply()
+                    updateListenLabel()
+                    status("Agora me chame de \"$s\".")
+                }
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
+    // =====================================================================
+    //  Calendário (mês completo) e tarefas
+    // =====================================================================
+
+    private fun cell(row: Int, col: Int, text: String, bold: Boolean, fg: Int, bgc: Int?): TextView {
         val tv = TextView(this)
         tv.text = text
         tv.gravity = Gravity.CENTER
-        tv.textSize = 20f
+        tv.textSize = 18f
         tv.setTextColor(fg)
         if (bold) tv.setTypeface(null, Typeface.BOLD)
         if (bgc != null) tv.setBackgroundColor(bgc)
         val p = GridLayout.LayoutParams(
-            GridLayout.spec(GridLayout.UNDEFINED),
-            GridLayout.spec(GridLayout.UNDEFINED, 1f)
+            GridLayout.spec(row, 1, GridLayout.FILL, if (row == 0) 0f else 1f),
+            GridLayout.spec(col, 1, GridLayout.FILL, 1f)
         )
         p.width = 0
-        p.height = dp(60)
+        p.height = if (row == 0) ViewGroup.LayoutParams.WRAP_CONTENT else 0
         p.setMargins(dp(2), dp(2), dp(2), dp(2))
         tv.layoutParams = p
         return tv
     }
 
-    private fun cap(s: String): String = s.replaceFirstChar { it.uppercase() }
-
-    // =====================================================================
-    //  Calendário e agenda
-    // =====================================================================
-
     private fun buildCalendar() {
         tvMonth.text = cap(monthFmt.format(shown.time))
         grid.removeAllViews()
-
-        val heads = arrayOf("Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sáb")
-        for (h in heads) grid.addView(cell(h, true, cGray, null))
 
         val first = shown.clone() as Calendar
         first.set(Calendar.DAY_OF_MONTH, 1)
         val offset = first.get(Calendar.DAY_OF_WEEK) - 1
         val daysInMonth = first.getActualMaximum(Calendar.DAY_OF_MONTH)
+        val weeks = (offset + daysInMonth + 6) / 7
+        grid.rowCount = weeks + 1
+        grid.columnCount = 7
+
+        val heads = arrayOf("Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sáb")
+        for (i in heads.indices) grid.addView(cell(0, i, heads[i], true, cGray, null))
+
         val todayKey = keyFmt.format(Date())
         val withEvents = loadEvents().map { it.date }.toSet()
 
-        for (i in 0 until offset) grid.addView(cell("", false, cText, null))
-
         for (d in 1..daysInMonth) {
+            val idx = offset + d - 1
             val k = String.format(
                 Locale.US, "%04d-%02d-%02d",
                 first.get(Calendar.YEAR), first.get(Calendar.MONTH) + 1, d
             )
             val isToday = k == todayKey
-            val dot = if (withEvents.contains(k)) "\n•" else ""
+            val hasEvent = withEvents.contains(k)
+            val bg = when {
+                isToday -> cAccent
+                hasEvent -> cEvent
+                else -> cCell
+            }
             grid.addView(
-                cell(
-                    "$d$dot",
-                    isToday,
-                    if (isToday) Color.WHITE else cText,
-                    if (isToday) cAccent else cCell
-                )
+                cell(1 + idx / 7, idx % 7, "$d", isToday, if (isToday) Color.WHITE else cText, bg)
             )
         }
     }
@@ -352,41 +521,33 @@ class MainActivity : Activity() {
     }
 
     private fun renderAgenda() {
-        agendaBox.removeAllViews()
+        tasksBox.removeAllViews()
         val todayKey = keyFmt.format(Date())
         val list = loadEvents()
             .filter { it.date >= todayKey }
             .sortedWith(compareBy<Ev>({ it.date }, { it.time }))
-            .take(30)
+            .take(3)
 
-        if (list.isEmpty()) {
+        for (slot in 0 until 3) {
             val tv = TextView(this)
-            tv.text = "Nenhum compromisso. Diga, por exemplo: \"criar agenda amanhã às 9 horas médico\"."
-            tv.textSize = 17f
-            tv.setTextColor(cGray)
-            agendaBox.addView(tv, lp())
-            return
-        }
-
-        for (e in list) {
-            val tv = TextView(this)
-            val hora = if (e.time.isEmpty()) "dia todo" else e.time
-            tv.text = "${dayLabel(e.date)} • $hora — ${e.title}"
-            tv.textSize = 20f
-            tv.setTextColor(cText)
+            tv.textSize = 19f
             tv.setBackgroundColor(cCell)
-            tv.setPadding(dp(10), dp(12), dp(10), dp(12))
-            tv.setOnLongClickListener {
-                deleteEvent(e.id)
-                true
+            tv.setPadding(dp(10), dp(10), dp(10), dp(10))
+            if (slot < list.size) {
+                val e = list[slot]
+                val hora = if (e.time.isEmpty()) "dia todo" else e.time
+                tv.text = "${dayLabel(e.date)} • $hora — ${e.title}"
+                tv.setTextColor(cText)
+                tv.setOnLongClickListener {
+                    deleteEvent(e.id)
+                    true
+                }
+            } else {
+                tv.text = if (slot == 0) "Nenhuma tarefa. Diga: \"$wakeName, criar agenda amanhã às 9 horas médico\"" else "—"
+                tv.setTextColor(cGray)
             }
-            agendaBox.addView(tv, lp(6))
+            tasksBox.addView(tv, lp(if (slot == 0) 0 else 6))
         }
-        val dica = TextView(this)
-        dica.text = "Segure o dedo sobre um compromisso para apagar."
-        dica.textSize = 14f
-        dica.setTextColor(cGray)
-        agendaBox.addView(dica, lp(8))
     }
 
     private fun loadEvents(): MutableList<Ev> {
@@ -429,7 +590,7 @@ class MainActivity : Activity() {
         saveEvents(loadEvents().filter { it.id != id })
         buildCalendar()
         renderAgenda()
-        status("Compromisso apagado.")
+        status("Tarefa apagada.")
     }
 
     // =====================================================================
@@ -438,7 +599,8 @@ class MainActivity : Activity() {
 
     private fun tick() {
         val now = Date()
-        tvClock.text = clockFmt.format(now)
+        val clock = clockFmt.format(now)
+        if (tvClock.text.toString() != clock) tvClock.text = clock
         val key = keyFmt.format(now)
         if (key != lastDayKey) {
             lastDayKey = key
@@ -462,6 +624,7 @@ class MainActivity : Activity() {
                 out.add(e.copy(notified = true))
                 tvBanner.text = "🔔 ${e.time}  ${e.title}\n(toque para fechar)"
                 tvBanner.visibility = View.VISIBLE
+                wakeUp(60000L)
                 try {
                     ToneGenerator(AudioManager.STREAM_ALARM, 100)
                         .startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 3000)
@@ -476,41 +639,175 @@ class MainActivity : Activity() {
     }
 
     // =====================================================================
-    //  Voz e comandos
+    //  Microfone sempre ouvindo (palavra de ativação = nome do assistente)
     // =====================================================================
 
     private fun status(msg: String) {
         tvStatus.text = msg
     }
 
-    private fun submitText() {
-        val s = input.text.toString().trim()
-        if (s.isNotEmpty()) {
-            input.setText("")
-            handle(s)
+    private fun startMic() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            if (!askedMic) {
+                askedMic = true
+                requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
+            } else {
+                status("Sem permissão do microfone. Libere em Configurações > Apps > Assistente > Permissões.")
+            }
+            updateListenLabel()
+            return
+        }
+        micWanted = true
+        muteBeeps(true)
+        updateListenLabel()
+        scheduleRestart(300)
+    }
+
+    private fun stopMic() {
+        micWanted = false
+        handler.removeCallbacks(restartRunnable)
+        destroyRecognizer()
+        muteBeeps(false)
+        if (::tvListen.isInitialized) updateListenLabel()
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 1) {
+            if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                startMic()
+            } else {
+                status("Sem permissão do microfone: só funciona digitando (toque aqui).")
+                updateListenLabel()
+            }
         }
     }
 
-    private fun listen() {
-        val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
-        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "pt-BR")
-        i.putExtra(RecognizerIntent.EXTRA_PROMPT, "Diga o comando")
+    /** Silencia os "plins" do reconhecedor de voz enquanto o app escuta. */
+    private fun muteBeeps(mute: Boolean) {
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val dir = if (mute) AudioManager.ADJUST_MUTE else AudioManager.ADJUST_UNMUTE
+        val streams = intArrayOf(
+            AudioManager.STREAM_NOTIFICATION,
+            AudioManager.STREAM_SYSTEM,
+            AudioManager.STREAM_MUSIC
+        )
+        for (s in streams) {
+            try {
+                am.adjustStreamVolume(s, dir, 0)
+            } catch (ex: Exception) {
+                // alguns aparelhos não permitem; sem problema
+            }
+        }
+    }
+
+    private fun scheduleRestart(ms: Long) {
+        handler.removeCallbacks(restartRunnable)
+        handler.postDelayed(restartRunnable, ms)
+    }
+
+    private fun destroyRecognizer() {
         try {
-            startActivityForResult(i, 100)
-        } catch (ex: ActivityNotFoundException) {
-            status("Este tablet não tem reconhecimento de voz. Instale ou atualize o app \"Google\" na Play Store. Enquanto isso, digite o comando.")
+            recognizer?.cancel()
+            recognizer?.destroy()
+        } catch (ex: Exception) {
+            // ignora
+        }
+        recognizer = null
+    }
+
+    private fun startRecognizer() {
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            status("Este tablet não tem reconhecimento de voz. Instale/atualize o app \"Google\" na Play Store.")
+            return
+        }
+        try {
+            if (recognizer == null) {
+                recognizer = SpeechRecognizer.createSpeechRecognizer(this)
+                recognizer?.setRecognitionListener(recListener)
+            }
+            val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+            i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "pt-BR")
+            i.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+            i.putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
+            recognizer?.startListening(i)
+        } catch (ex: Exception) {
+            destroyRecognizer()
+            scheduleRestart(3000)
         }
     }
 
-    @Deprecated("Deprecated in Java")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == 100 && resultCode == RESULT_OK && data != null) {
-            val r = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
-            if (r != null && r.isNotEmpty()) handle(r[0])
+    private val recListener = object : RecognitionListener {
+        override fun onReadyForSpeech(params: Bundle?) {}
+        override fun onBeginningOfSpeech() {}
+        override fun onRmsChanged(rmsdB: Float) {}
+        override fun onBufferReceived(buffer: ByteArray?) {}
+        override fun onEndOfSpeech() {}
+        override fun onPartialResults(partialResults: Bundle?) {}
+        override fun onEvent(eventType: Int, params: Bundle?) {}
+
+        override fun onError(error: Int) {
+            when (error) {
+                SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
+                    micWanted = false
+                    status("Sem permissão do microfone.")
+                    updateListenLabel()
+                }
+                SpeechRecognizer.ERROR_NO_MATCH,
+                SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> scheduleRestart(200)
+                SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> {
+                    destroyRecognizer()
+                    scheduleRestart(1500)
+                }
+                SpeechRecognizer.ERROR_NETWORK,
+                SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> {
+                    status("Sem internet: o reconhecimento de voz precisa de conexão.")
+                    destroyRecognizer()
+                    scheduleRestart(5000)
+                }
+                else -> {
+                    destroyRecognizer()
+                    scheduleRestart(2500)
+                }
+            }
+        }
+
+        override fun onResults(results: Bundle?) {
+            val l = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+            if (l != null && l.isNotEmpty()) onHeard(l[0])
+            scheduleRestart(150)
         }
     }
+
+    /** Remove o nome do assistente da frase. Devolve null se o nome não foi dito. */
+    private fun stripName(raw: String): String? {
+        val name = deacc(wakeName).trim()
+        if (name.isEmpty()) return null
+        val m = Regex("\\b" + Regex.escape(name) + "\\b").find(deacc(raw)) ?: return null
+        return (raw.substring(0, m.range.first) + " " + raw.substring(m.range.last + 1))
+            .replace(Regex("\\s+"), " ")
+            .trim()
+            .trim(',', '.', '!', '?', ' ')
+    }
+
+    private fun onHeard(raw: String) {
+        val stripped = stripName(raw)
+        // Em espera: só reage se ouvir o nome. Acordado: qualquer frase é comando.
+        if (!awake && stripped == null) return
+        wakeUp()
+        val cmd = stripped ?: raw
+        if (cmd.isEmpty()) {
+            status("Pois não? Pode falar o comando.")
+        } else {
+            status("Ouvi: \"$cmd\"")
+            handle(cmd)
+        }
+    }
+
+    // =====================================================================
+    //  Comandos
+    // =====================================================================
 
     /** Troca letras acentuadas por simples, mantendo o MESMO tamanho do texto. */
     private fun deacc(s: String): String {
@@ -542,6 +839,7 @@ class MainActivity : Activity() {
             }
             isEvent -> createEvent(raw)
             t.contains("lampada") || Regex("\\bluz(es)?\\b").containsMatchIn(t) -> lamps(t)
+            t.contains("dormir") || t.contains("boa noite") || t.contains("tela escura") -> goToSleep()
             else -> status("Não entendi: \"$raw\"")
         }
     }
@@ -568,14 +866,14 @@ class MainActivity : Activity() {
     }
 
     private fun setScreenLight(on: Boolean) {
+        screenLightOn = on
         whiteOverlay.visibility = if (on) View.VISIBLE else View.GONE
-        val p = window.attributes
-        p.screenBrightness = if (on) 1f else WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
-        window.attributes = p
+        applyMode()
         status(
             if (on) "Lanterna de tela acesa (este tablet não tem flash). Toque na tela para apagar."
             else "Lanterna de tela apagada."
         )
+        if (!on) wakeUp()
     }
 
     // ---------- lâmpadas (PRÓXIMA ETAPA) ----------
@@ -586,7 +884,7 @@ class MainActivity : Activity() {
         status("Entendi: ${if (off) "apagar" else "acender"} a luz. Falta conectar com a marca das suas lâmpadas (próxima etapa).")
     }
 
-    // ---------- criar compromisso por voz ----------
+    // ---------- criar tarefa por voz ----------
 
     private fun createEvent(raw: String) {
         val t = deacc(raw)
