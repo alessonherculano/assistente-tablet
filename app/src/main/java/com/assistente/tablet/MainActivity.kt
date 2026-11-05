@@ -30,6 +30,19 @@ import android.widget.FrameLayout
 import android.widget.GridLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.net.Uri
+import android.text.InputType
+import android.view.TextureView
+import android.widget.CheckBox
+import android.widget.PopupMenu
+import android.widget.ScrollView
+import android.widget.SeekBar
+import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.rtsp.RtspMediaSource
 import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
@@ -38,6 +51,30 @@ import java.util.Date
 import java.util.Locale
 
 class MainActivity : Activity() {
+
+    /** Item cadastrado pelo menu: câmera IP, disjuntor, lâmpada... */
+    data class Dev(
+        val id: Long,
+        val type: String,
+        val name: String,
+        val host: String,      // IP (ou ID do dispositivo, nos não-câmera)
+        val port: Int,         // porta RTSP (câmeras)
+        val user: String,
+        val pass: String,
+        val path: String,      // caminho do vídeo RTSP (câmeras)
+        val street: Boolean    // true = é a "câmera da rua" (botão 1)
+    ) {
+        val isCamera: Boolean get() = type == "cam_tapo" || type == "cam_intelbras"
+    }
+
+    private val DEV_TYPES = listOf(
+        "cam_tapo" to "📹 Câmera Tapo (TP-Link)",
+        "cam_intelbras" to "📹 Câmera Intelbras",
+        "tuya_breaker" to "⚡ Disjuntor inteligente Tuya",
+        "positivo_lamp" to "💡 Lâmpada Positivo",
+        "positivo_breaker" to "⚡ Disjuntor Positivo",
+        "other" to "➕ Outro dispositivo"
+    )
 
     data class Ev(
         val id: Long,
@@ -57,11 +94,12 @@ class MainActivity : Activity() {
     private val DEFAULT_NAME = "Luna"      // nome inicial do assistente
 
     // ---------- cores (tema escuro) ----------
-    private val cText = Color.parseColor("#E6E6E6")
-    private val cGray = Color.parseColor("#8A8F98")
+    private var cBg = Color.BLACK
+    private var cText = Color.parseColor("#E6E6E6")
+    private var cGray = Color.parseColor("#8A8F98")
     private val cAccent = Color.parseColor("#1565C0")
-    private val cCell = Color.parseColor("#1A1D22")
-    private val cEvent = Color.parseColor("#1F3A5F")
+    private var cCell = Color.parseColor("#1A1D22")
+    private var cEvent = Color.parseColor("#1F3A5F")
 
     // ---------- formatos ----------
     private val ptBR = Locale("pt", "BR")
@@ -82,6 +120,13 @@ class MainActivity : Activity() {
     private lateinit var grid: GridLayout
     private lateinit var tasksBox: LinearLayout
     private lateinit var whiteOverlay: View
+    private lateinit var menuBtn: Button
+    private lateinit var cameraBox: LinearLayout
+    private lateinit var cameraFrame: FrameLayout
+    private lateinit var cameraView: TextureView
+    private lateinit var tvCamMsg: TextView
+    private lateinit var shortcutsBox: LinearLayout
+    private var navButtons: List<Button> = emptyList()
 
     // ---------- estado ----------
     private val handler = Handler(Looper.getMainLooper())
@@ -91,6 +136,12 @@ class MainActivity : Activity() {
     private var awake = false
     private var screenLightOn = false
     private var wakeName = DEFAULT_NAME
+    private var awakeBrightness = AWAKE_BRIGHTNESS
+    private var dimBrightness = DIM_BRIGHTNESS
+    private var darkMode = true
+    private var viewMode = 0               // 0 = calendário, 1 = câmera, 2 = atalhos
+    private var player: ExoPlayer? = null
+    private var currentCam: Dev? = null
 
     // ---------- microfone ----------
     private var recognizer: SpeechRecognizer? = null
@@ -107,7 +158,7 @@ class MainActivity : Activity() {
     }
 
     private val sleepRunnable = Runnable {
-        if (screenLightOn || tvBanner.visibility == View.VISIBLE) {
+        if (screenLightOn || viewMode == 1 || tvBanner.visibility == View.VISIBLE) {
             scheduleSleep(AWAKE_MS)
         } else {
             goToSleep()
@@ -126,6 +177,10 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         wakeName = prefs.getString("wake_name", DEFAULT_NAME) ?: DEFAULT_NAME
+        awakeBrightness = prefs.getFloat("awake_br", AWAKE_BRIGHTNESS)
+        dimBrightness = prefs.getFloat("dim_br", DIM_BRIGHTNESS)
+        darkMode = prefs.getBoolean("dark", true)
+        applyTheme()
         buildUi()
         updateListenLabel()
         applyMode()
@@ -137,13 +192,20 @@ class MainActivity : Activity() {
         handler.post(ticker)
         wakeUp()
         startMic()
+        if (viewMode == 1) currentCam?.let { startStream(it) }
     }
 
     override fun onPause() {
         super.onPause()
         handler.removeCallbacks(ticker)
         handler.removeCallbacks(sleepRunnable)
+        releasePlayer()
         stopMic()
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onBackPressed() {
+        if (viewMode != 0) showHome() else super.onBackPressed()
     }
 
     @Suppress("DEPRECATION")
@@ -177,11 +239,12 @@ class MainActivity : Activity() {
 
     private fun applyMode() {
         main.alpha = if (awake || screenLightOn) 1f else DIM_ALPHA
+        menuBtn.alpha = main.alpha
         val p = window.attributes
         p.screenBrightness = when {
             screenLightOn -> 1f
-            awake -> AWAKE_BRIGHTNESS
-            else -> DIM_BRIGHTNESS
+            awake -> awakeBrightness
+            else -> dimBrightness
         }
         window.attributes = p
     }
@@ -240,7 +303,7 @@ class MainActivity : Activity() {
         val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
 
         val root = FrameLayout(this)
-        root.setBackgroundColor(Color.BLACK)
+        root.setBackgroundColor(cBg)
 
         main = LinearLayout(this)
         main.orientation = LinearLayout.VERTICAL
@@ -269,7 +332,7 @@ class MainActivity : Activity() {
         clockPanel.gravity = Gravity.CENTER
 
         tvClock = TextView(this)
-        tvClock.textSize = 120f
+        tvClock.textSize = prefs.getInt("clock_size", 120).toFloat()
         tvClock.setTypeface(null, Typeface.BOLD)
         tvClock.setTextColor(cText)
         tvClock.gravity = Gravity.CENTER
@@ -290,6 +353,8 @@ class MainActivity : Activity() {
         val nav = LinearLayout(this)
         nav.orientation = LinearLayout.HORIZONTAL
         nav.gravity = Gravity.CENTER_VERTICAL
+        // deixa espaço para o botão do menu (canto superior direito)
+        nav.setPadding(0, 0, if (landscape) dp(70) else 0, 0)
 
         val prev = Button(this)
         prev.text = "◀"
@@ -319,11 +384,42 @@ class MainActivity : Activity() {
         nav.addView(tvMonth, LinearLayout.LayoutParams(0, wrap, 1f))
         nav.addView(next, LinearLayout.LayoutParams(wrap, wrap))
         nav.addView(today, LinearLayout.LayoutParams(wrap, wrap))
+        navButtons = listOf(prev, next, today)
         calPanel.addView(nav, lp())
+
+        // ----- área que troca: calendário / câmera / atalhos -----
+        val content = FrameLayout(this)
 
         grid = GridLayout(this)
         grid.columnCount = 7
-        calPanel.addView(grid, LinearLayout.LayoutParams(match, 0, 1f))
+        content.addView(grid, FrameLayout.LayoutParams(match, match))
+
+        cameraBox = LinearLayout(this)
+        cameraBox.orientation = LinearLayout.VERTICAL
+        cameraBox.visibility = View.GONE
+        cameraFrame = FrameLayout(this)
+        cameraFrame.setBackgroundColor(Color.BLACK)
+        cameraView = TextureView(this)
+        cameraFrame.addView(cameraView, FrameLayout.LayoutParams(match, match, Gravity.CENTER))
+        tvCamMsg = TextView(this)
+        tvCamMsg.textSize = 18f
+        tvCamMsg.setTextColor(Color.WHITE)
+        tvCamMsg.gravity = Gravity.CENTER
+        tvCamMsg.setPadding(dp(16), dp(16), dp(16), dp(16))
+        tvCamMsg.setOnClickListener { showCamOptions() }
+        cameraFrame.addView(tvCamMsg, FrameLayout.LayoutParams(match, match))
+        cameraBox.addView(cameraFrame, LinearLayout.LayoutParams(match, 0, 1f))
+        val camBackParams = LinearLayout.LayoutParams(match, dp(72))
+        camBackParams.topMargin = dp(6)
+        cameraBox.addView(backButton(), camBackParams)
+        content.addView(cameraBox, FrameLayout.LayoutParams(match, match))
+
+        shortcutsBox = LinearLayout(this)
+        shortcutsBox.orientation = LinearLayout.VERTICAL
+        shortcutsBox.visibility = View.GONE
+        content.addView(shortcutsBox, FrameLayout.LayoutParams(match, match))
+
+        calPanel.addView(content, LinearLayout.LayoutParams(match, 0, 1f))
 
         top.addView(clockPanel, half(landscape))
         top.addView(calPanel, half(landscape))
@@ -353,10 +449,14 @@ class MainActivity : Activity() {
         buttonsRow.setPadding(dp(8), dp(6), 0, 0)
         for (n in 1..3) {
             val b = Button(this)
-            b.text = "Função $n\n(em breve)"
+            b.text = when (n) {
+                1 -> "📹\nCâmera da rua"
+                2 -> "🔘\nAtalhos"
+                else -> "Função $n\n(em breve)"
+            }
             b.setAllCaps(false)
             b.textSize = 18f
-            b.setTextColor(cGray)
+            b.setTextColor(if (n <= 2) cText else cGray)
             b.setBackgroundColor(cCell)
             b.setOnClickListener { onFuncButton(n) }
             val p = LinearLayout.LayoutParams(0, match, 1f)
@@ -392,6 +492,17 @@ class MainActivity : Activity() {
 
         root.addView(main, FrameLayout.LayoutParams(match, match))
 
+        // ----- botão do menu (canto superior direito) -----
+        menuBtn = Button(this)
+        menuBtn.text = "☰"
+        menuBtn.textSize = 22f
+        menuBtn.setTextColor(cText)
+        menuBtn.setBackgroundColor(cCell)
+        menuBtn.setOnClickListener { showMenu() }
+        val menuParams = FrameLayout.LayoutParams(dp(60), dp(48), Gravity.TOP or Gravity.END)
+        menuParams.setMargins(0, dp(10), dp(14), 0)
+        root.addView(menuBtn, menuParams)
+
         // Tela branca usada como "lanterna de tela" quando o tablet não tem flash
         whiteOverlay = View(this)
         whiteOverlay.setBackgroundColor(Color.WHITE)
@@ -402,6 +513,470 @@ class MainActivity : Activity() {
         setContentView(root)
     }
 
+    // =====================================================================
+    //  Tema, menu (☰), itens cadastrados, câmera e atalhos
+    // =====================================================================
+
+    private fun applyTheme() {
+        if (darkMode) {
+            cBg = Color.BLACK
+            cText = Color.parseColor("#E6E6E6")
+            cGray = Color.parseColor("#8A8F98")
+            cCell = Color.parseColor("#1A1D22")
+            cEvent = Color.parseColor("#1F3A5F")
+        } else {
+            cBg = Color.parseColor("#F2F4F7")
+            cText = Color.parseColor("#1B1F24")
+            cGray = Color.parseColor("#5F6672")
+            cCell = Color.parseColor("#DDE2E9")
+            cEvent = Color.parseColor("#B5CDEE")
+        }
+    }
+
+    private fun showMenu() {
+        wakeUp(60000L)
+        val pm = PopupMenu(this, menuBtn)
+        pm.menu.add(0, 1, 0, "✏️  Editar layout")
+        pm.menu.add(0, 2, 1, "🔆  Brilho")
+        pm.menu.add(0, 3, 2, if (darkMode) "☀️  Modo claro" else "🌙  Modo escuro")
+        pm.menu.add(0, 4, 3, "➕  Adicionar item")
+        pm.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                1 -> showLayoutDialog()
+                2 -> showBrightnessDialog()
+                3 -> {
+                    darkMode = !darkMode
+                    prefs.edit().putBoolean("dark", darkMode).apply()
+                    recreate()
+                }
+                4 -> showAddDialog()
+            }
+            true
+        }
+        pm.show()
+    }
+
+    // ---------- editar layout ----------
+
+    private fun showLayoutDialog() {
+        wakeUp(60000L)
+        val names = arrayOf("Pequeno", "Médio", "Grande", "Extra grande")
+        val sizes = intArrayOf(80, 100, 120, 150)
+        val cur = sizes.indexOf(prefs.getInt("clock_size", 120)).coerceAtLeast(0)
+        AlertDialog.Builder(this)
+            .setTitle("Tamanho do relógio")
+            .setSingleChoiceItems(names, cur) { d, which ->
+                prefs.edit().putInt("clock_size", sizes[which]).apply()
+                d.dismiss()
+                recreate()
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
+    // ---------- brilho ----------
+
+    private fun showBrightnessDialog() {
+        wakeUp(60000L)
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+        box.setPadding(dp(20), dp(10), dp(20), dp(0))
+
+        fun addSlider(label: String, start: Float, minPct: Int, save: (Float) -> Unit) {
+            val tv = TextView(this)
+            tv.textSize = 16f
+            val sb = SeekBar(this)
+            sb.max = 100 - minPct
+            sb.progress = ((start * 100).toInt() - minPct).coerceIn(0, sb.max)
+            tv.text = "$label: ${sb.progress + minPct}%"
+            sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar?, progress: Int, fromUser: Boolean) {
+                    val pct = progress + minPct
+                    tv.text = "$label: $pct%"
+                    save(pct / 100f)
+                    applyMode()
+                }
+                override fun onStartTrackingTouch(s: SeekBar?) {}
+                override fun onStopTrackingTouch(s: SeekBar?) {}
+            })
+            box.addView(tv, lp(10))
+            box.addView(sb, lp(4))
+        }
+
+        addSlider("Brilho com a tela ativa", awakeBrightness, 5) {
+            awakeBrightness = it
+            prefs.edit().putFloat("awake_br", it).apply()
+        }
+        addSlider("Brilho em espera (escuro)", dimBrightness, 1) {
+            dimBrightness = it
+            prefs.edit().putFloat("dim_br", it).apply()
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("Brilho")
+            .setView(box)
+            .setPositiveButton("OK", null)
+            .show()
+    }
+
+    // ---------- itens cadastrados ----------
+
+    private fun typeName(type: String): String =
+        DEV_TYPES.firstOrNull { it.first == type }?.second ?: type
+
+    private fun loadDevices(): MutableList<Dev> {
+        val out = ArrayList<Dev>()
+        try {
+            val a = JSONArray(prefs.getString("devices", "[]") ?: "[]")
+            for (i in 0 until a.length()) {
+                val o = a.getJSONObject(i)
+                out.add(
+                    Dev(
+                        o.getLong("id"), o.getString("type"), o.getString("name"),
+                        o.optString("host"), o.optInt("port", 554),
+                        o.optString("user"), o.optString("pass"),
+                        o.optString("path"), o.optBoolean("street")
+                    )
+                )
+            }
+        } catch (ex: Exception) {
+            // lista corrompida: começa vazia
+        }
+        return out
+    }
+
+    private fun saveDevices(list: List<Dev>) {
+        val a = JSONArray()
+        for (d in list) {
+            a.put(
+                JSONObject()
+                    .put("id", d.id).put("type", d.type).put("name", d.name)
+                    .put("host", d.host).put("port", d.port)
+                    .put("user", d.user).put("pass", d.pass)
+                    .put("path", d.path).put("street", d.street)
+            )
+        }
+        prefs.edit().putString("devices", a.toString()).apply()
+    }
+
+    private fun showAddDialog() {
+        wakeUp(60000L)
+        val labels = DEV_TYPES.map { it.second }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("Adicionar item")
+            .setItems(labels) { _, which -> showDeviceForm(DEV_TYPES[which].first) }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
+    private fun field(
+        box: LinearLayout, hint: String, text: String = "",
+        password: Boolean = false, number: Boolean = false
+    ): EditText {
+        val et = EditText(this)
+        et.hint = hint
+        et.setText(text)
+        et.inputType = when {
+            password -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            number -> InputType.TYPE_CLASS_NUMBER
+            else -> InputType.TYPE_CLASS_TEXT
+        }
+        box.addView(et, lp(4))
+        return et
+    }
+
+    private fun showDeviceForm(type: String) {
+        wakeUp(120000L)
+        val isCam = type == "cam_tapo" || type == "cam_intelbras"
+        val sv = ScrollView(this)
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+        box.setPadding(dp(20), dp(8), dp(20), dp(0))
+        sv.addView(box)
+
+        val etName = field(box, if (isCam) "Nome (ex.: Câmera da rua)" else "Nome (ex.: Luz da sala)")
+        val etHost = field(
+            box,
+            if (isCam) "IP da câmera (ex.: 192.168.0.50)" else "IP ou ID do dispositivo (opcional)"
+        )
+        var etPort: EditText? = null
+        var etUser: EditText? = null
+        var etPass: EditText? = null
+        var etPath: EditText? = null
+        var chk: CheckBox? = null
+        if (isCam) {
+            etPort = field(box, "Porta RTSP", "554", number = true)
+            etUser = field(
+                box,
+                if (type == "cam_tapo") "Usuário da conta da câmera (criada no app Tapo)" else "Usuário (ex.: admin)"
+            )
+            etPass = field(box, "Senha", password = true)
+            etPath = field(
+                box, "Caminho do vídeo",
+                if (type == "cam_tapo") "/stream1" else "/cam/realmonitor?channel=1&subtype=0"
+            )
+            val c = CheckBox(this)
+            c.text = "É a câmera da rua (abre no botão 1)"
+            c.isChecked = loadDevices().none { it.street }
+            box.addView(c, lp(8))
+            chk = c
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle(typeName(type))
+            .setView(sv)
+            .setPositiveButton("Salvar") { _, _ ->
+                val name = etName.text.toString().trim()
+                if (name.isEmpty()) {
+                    status("Informe um nome para o item.")
+                    return@setPositiveButton
+                }
+                val street = chk?.isChecked == true
+                val list = loadDevices().map { if (street && it.street) it.copy(street = false) else it }.toMutableList()
+                var path = etPath?.text?.toString()?.trim() ?: ""
+                if (path.isNotEmpty() && !path.startsWith("/")) path = "/$path"
+                list.add(
+                    Dev(
+                        System.currentTimeMillis(), type, name,
+                        etHost.text.toString().trim(),
+                        etPort?.text?.toString()?.toIntOrNull() ?: 554,
+                        etUser?.text?.toString()?.trim() ?: "",
+                        etPass?.text?.toString() ?: "",
+                        path, street
+                    )
+                )
+                saveDevices(list)
+                status("\"$name\" adicionado.")
+                if (viewMode == 2) buildShortcuts()
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
+    // ---------- trocar a área do calendário ----------
+
+    private fun showView(mode: Int, title: String = "") {
+        viewMode = mode
+        grid.visibility = if (mode == 0) View.VISIBLE else View.GONE
+        cameraBox.visibility = if (mode == 1) View.VISIBLE else View.GONE
+        shortcutsBox.visibility = if (mode == 2) View.VISIBLE else View.GONE
+        for (b in navButtons) b.visibility = if (mode == 0) View.VISIBLE else View.GONE
+        if (mode == 0) {
+            releasePlayer()
+            currentCam = null
+            buildCalendar()
+        } else {
+            tvMonth.text = title
+        }
+        wakeUp()
+    }
+
+    private fun showHome() = showView(0)
+
+    private fun backButton(): Button {
+        val b = Button(this)
+        b.text = "⬅  Voltar ao início"
+        b.setAllCaps(false)
+        b.textSize = 24f
+        b.setTextColor(Color.WHITE)
+        b.setBackgroundColor(cAccent)
+        b.setOnClickListener { showHome() }
+        return b
+    }
+
+    // ---------- botão 2: atalhos (10 botões) ----------
+
+    private fun openShortcuts() {
+        buildShortcuts()
+        showView(2, "🔘 Atalhos")
+    }
+
+    private fun buildShortcuts() {
+        shortcutsBox.removeAllViews()
+        val match = ViewGroup.LayoutParams.MATCH_PARENT
+        val items = loadDevices().filter { !it.isCamera }
+
+        val rows = LinearLayout(this)
+        rows.orientation = LinearLayout.VERTICAL
+        for (r in 0 until 2) {
+            val row = LinearLayout(this)
+            row.orientation = LinearLayout.HORIZONTAL
+            for (c in 0 until 5) {
+                val n = r * 5 + c
+                val dev = items.getOrNull(n)
+                val b = Button(this)
+                b.setAllCaps(false)
+                b.textSize = 16f
+                b.setBackgroundColor(cCell)
+                if (dev != null) {
+                    b.text = dev.name
+                    b.setTextColor(cText)
+                    b.setOnClickListener { onDeviceButton(dev) }
+                    b.setOnLongClickListener {
+                        confirmDelete(dev)
+                        true
+                    }
+                } else {
+                    b.text = "Botão ${n + 1}\n(vazio)"
+                    b.setTextColor(cGray)
+                    b.setOnClickListener {
+                        wakeUp()
+                        status("Botão ${n + 1} está vazio. Use ☰ > Adicionar item.")
+                    }
+                }
+                val p = LinearLayout.LayoutParams(0, match, 1f)
+                p.setMargins(dp(4), dp(4), dp(4), dp(4))
+                row.addView(b, p)
+            }
+            rows.addView(row, LinearLayout.LayoutParams(match, 0, 1f))
+        }
+        shortcutsBox.addView(rows, LinearLayout.LayoutParams(match, 0, 1f))
+
+        val backParams = LinearLayout.LayoutParams(match, dp(72))
+        backParams.topMargin = dp(6)
+        shortcutsBox.addView(backButton(), backParams)
+    }
+
+    private fun onDeviceButton(dev: Dev) {
+        wakeUp()
+        // PRÓXIMA ETAPA: aqui entra o controle real (Tuya / Positivo)
+        status("\"${dev.name}\" cadastrado. Falta conectar o controle (${typeName(dev.type)}) — próxima etapa.")
+    }
+
+    private fun confirmDelete(dev: Dev) {
+        wakeUp(60000L)
+        AlertDialog.Builder(this)
+            .setTitle("Remover item")
+            .setMessage("Remover \"${dev.name}\"?")
+            .setPositiveButton("Remover") { _, _ ->
+                saveDevices(loadDevices().filter { it.id != dev.id })
+                buildShortcuts()
+                status("Item removido.")
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
+    // ---------- botão 1: câmera da rua ----------
+
+    private fun openCamera() {
+        wakeUp(60000L)
+        val cams = loadDevices().filter { it.isCamera }
+        val street = cams.firstOrNull { it.street }
+        when {
+            cams.isEmpty() -> AlertDialog.Builder(this)
+                .setTitle("Nenhuma câmera cadastrada")
+                .setMessage("Cadastrar a câmera da rua agora?")
+                .setPositiveButton("Cadastrar") { _, _ -> showAddDialog() }
+                .setNegativeButton("Agora não", null)
+                .show()
+            street != null -> showCamera(street)
+            cams.size == 1 -> showCamera(cams[0])
+            else -> AlertDialog.Builder(this)
+                .setTitle("Qual câmera?")
+                .setItems(cams.map { it.name }.toTypedArray()) { _, i -> showCamera(cams[i]) }
+                .setNegativeButton("Cancelar", null)
+                .show()
+        }
+    }
+
+    private fun showCamera(dev: Dev) {
+        currentCam = dev
+        showView(1, "📹 ${dev.name}")
+        startStream(dev)
+    }
+
+    private fun startStream(dev: Dev) {
+        releasePlayer()
+        tvCamMsg.visibility = View.VISIBLE
+        if (dev.host.isEmpty()) {
+            tvCamMsg.text = "Esta câmera está sem IP.\nToque aqui para opções."
+            return
+        }
+        tvCamMsg.text = "Conectando à câmera…"
+        val cred = if (dev.user.isNotEmpty()) {
+            Uri.encode(dev.user) + (if (dev.pass.isNotEmpty()) ":" + Uri.encode(dev.pass) else "") + "@"
+        } else ""
+        val path = if (dev.path.isEmpty() || dev.path.startsWith("/")) dev.path else "/" + dev.path
+        val url = "rtsp://$cred${dev.host}:${dev.port}$path"
+        try {
+            val p = ExoPlayer.Builder(this).build()
+            p.setVideoTextureView(cameraView)
+            p.volume = 0f
+            p.addListener(object : Player.Listener {
+                override fun onPlaybackStateChanged(state: Int) {
+                    if (state == Player.STATE_READY) {
+                        tvCamMsg.visibility = View.GONE
+                    } else if (state == Player.STATE_BUFFERING) {
+                        tvCamMsg.text = "Carregando vídeo…"
+                        tvCamMsg.visibility = View.VISIBLE
+                    }
+                }
+
+                override fun onVideoSizeChanged(videoSize: VideoSize) {
+                    fitVideo(videoSize.width, videoSize.height)
+                }
+
+                override fun onPlayerError(error: PlaybackException) {
+                    tvCamMsg.text = "Não consegui abrir a câmera (${error.errorCodeName}).\n" +
+                        "Confira IP, usuário, senha e caminho.\nToque aqui para opções."
+                    tvCamMsg.visibility = View.VISIBLE
+                }
+            })
+            val source = RtspMediaSource.Factory()
+                .setForceUseRtpTcp(true)
+                .createMediaSource(MediaItem.fromUri(url))
+            p.setMediaSource(source)
+            p.playWhenReady = true
+            p.prepare()
+            player = p
+        } catch (ex: Exception) {
+            tvCamMsg.text = "Erro ao iniciar o vídeo.\nToque aqui para opções."
+        }
+    }
+
+    /** Ajusta o vídeo para caber na área sem esticar. */
+    private fun fitVideo(w: Int, h: Int) {
+        if (w <= 0 || h <= 0) return
+        cameraFrame.post {
+            val bw = cameraFrame.width
+            val bh = cameraFrame.height
+            if (bw > 0 && bh > 0) {
+                val scale = minOf(bw.toFloat() / w, bh.toFloat() / h)
+                cameraView.layoutParams = FrameLayout.LayoutParams(
+                    (w * scale).toInt(), (h * scale).toInt(), Gravity.CENTER
+                )
+            }
+        }
+    }
+
+    private fun releasePlayer() {
+        try {
+            player?.release()
+        } catch (ex: Exception) {
+            // ignora
+        }
+        player = null
+    }
+
+    private fun showCamOptions() {
+        val dev = currentCam ?: return
+        wakeUp(60000L)
+        AlertDialog.Builder(this)
+            .setTitle(dev.name)
+            .setItems(arrayOf("Tentar de novo", "Remover esta câmera")) { _, i ->
+                if (i == 0) {
+                    startStream(dev)
+                } else {
+                    saveDevices(loadDevices().filter { it.id != dev.id })
+                    showHome()
+                    status("Câmera removida. Cadastre de novo em ☰ > Adicionar item.")
+                }
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
     private fun updateListenLabel() {
         tvListen.text = if (micWanted) "🎤 Diga \"$wakeName\"" else "🎤 desligado"
     }
@@ -409,9 +984,14 @@ class MainActivity : Activity() {
     private fun cap(s: String): String = s.replaceFirstChar { it.uppercase() }
 
     private fun onFuncButton(n: Int) {
-        // PRÓXIMAS ETAPAS: cada botão poderá ligar uma função (luzes, música, etc.)
-        wakeUp()
-        status("O botão $n ainda não tem função. Em breve!")
+        when (n) {
+            1 -> openCamera()
+            2 -> openShortcuts()
+            else -> {
+                wakeUp()
+                status("O botão $n ainda não tem função. Em breve!")
+            }
+        }
     }
 
     private fun showTypeDialog() {
@@ -476,7 +1056,7 @@ class MainActivity : Activity() {
     }
 
     private fun buildCalendar() {
-        tvMonth.text = cap(monthFmt.format(shown.time))
+        if (viewMode == 0) tvMonth.text = cap(monthFmt.format(shown.time))
         grid.removeAllViews()
 
         val first = shown.clone() as Calendar
@@ -838,6 +1418,8 @@ class MainActivity : Activity() {
                 setTorch(!off)
             }
             isEvent -> createEvent(raw)
+            Regex("\\bcamera").containsMatchIn(t) -> openCamera()
+            Regex("\\b(inicio|voltar)\\b").containsMatchIn(t) -> showHome()
             t.contains("lampada") || Regex("\\bluz(es)?\\b").containsMatchIn(t) -> lamps(t)
             t.contains("dormir") || t.contains("boa noite") || t.contains("tela escura") -> goToSleep()
             else -> status("Não entendi: \"$raw\"")
